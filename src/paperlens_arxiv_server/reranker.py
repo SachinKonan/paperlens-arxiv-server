@@ -1,24 +1,27 @@
-"""PaperLens reranker: score(papers) -> list[float].
+"""PaperLens vision reranker: score(papers) -> list[p_accept].
 
-This mirrors the lab's inference pipeline exactly (see scripts/vllm_infer.py
-in paperlens-training-and-inference, modified to record logprob arrays):
+Mirrors the lab's vision inference pipeline (RANKER.md §4.2 + scripts/vllm_infer.py
+in paperlens-training-and-inference):
 
-  1. Build the canonical ShareGPT messages [system, user_with_paper].
-  2. Apply the model's chat template with ``add_generation_prompt=True``
-     so the assistant turn starts fresh.
-  3. Sample (greedy) up to ``max_new_tokens=8`` tokens with ``logprobs=5``
-     so we capture the top-5 token logprobs at every step.
-  4. The decision token sits at **position ``DECISION_TOKEN_IDX=5``** of the
-     generated sequence: ``Outcome``, ``:``, `` \\``, ``boxed``, ``{``,
-     ``Accept|Reject``.
-  5. Score = ``logprob_accept[5] - logprob_reject[5]`` — the same formula
-     that drives ``iclr_calibrated_acc_2526.py`` and ``arxiv_calibrated_acc.py``.
+  1. Build ShareGPT messages [system, user(prompt + title + abstract + N <image>)].
+  2. Apply qwen2_vl chat template with add_generation_prompt=True so the
+     assistant turn starts fresh.
+  3. Pass per-paper PIL page images via vLLM's multi_modal_data={"image": [...]}.
+  4. Greedy sample max_tokens=8 with logprobs=5 -- captures the top-5
+     token logprobs at every step.
+  5. The decision token is at position DECISION_TOKEN_IDX=5 in the
+     generated sequence: Outcome / : / " \\" / boxed / { / Accept|Reject.
+  6. Score per RANKER.md §4.2:
+        p_accept = exp(logp_accept[5]) / (exp(logp_accept[5]) + exp(logp_reject[5]))
+     This is the 2-token softmax (calibrated to {Accept, Reject}), in [0, 1].
 
-Higher score => more likely to be accepted at a top venue.
+Identical to what RANKER.md §6.1 ran offline to produce predictions_3b.parquet,
+which the cache layer can bootstrap from.
 """
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional
 
 from .prompts import SHAREGPT_SYSTEM_PROMPT, build_user_turn
@@ -27,72 +30,85 @@ from .retriever_client import RetrievedPaper
 
 log = logging.getLogger(__name__)
 
-# Matches scripts/iclr_calibrated_acc_2526.py and main repo vllm_infer.py:
-# "Outcome:" + " " + "\\" + "boxed" + "{" -- 5 tokens before X under
-# the Qwen2.5 BPE tokenizer.
+# Position of the Accept|Reject token in "Outcome: \\boxed{X" under the
+# Qwen2.5 BPE tokenizer (5 leading tokens: Outcome / : / " \\" / boxed / { ).
 DECISION_TOKEN_IDX = 5
 ACCEPT_TOKEN = "Accept"
 REJECT_TOKEN = "Reject"
 
 
+def _softmax2(logp_a: float, logp_b: float) -> float:
+    """Renormalized 2-token softmax. Returns p(a)/(p(a)+p(b))."""
+    # Stable form: subtract max from both before exp
+    m = max(logp_a, logp_b)
+    ea = math.exp(logp_a - m)
+    eb = math.exp(logp_b - m)
+    return ea / (ea + eb)
+
+
 class PaperLensReranker:
-    def __init__(self, hf_repo: str, *, modality: str = "text", domain: str = "arxiv",
-                 tensor_parallel_size: int = 1, gpu_memory_utilization: float = 0.6,
-                 max_model_len: int = 24576):
-        self.hf_repo = hf_repo
+    def __init__(
+        self,
+        ckpt_path: str,
+        *,
+        modality: str = "vision",
+        domain: str = "arxiv",
+        template: str = "qwen2_vl",
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.7,
+        max_model_len: int = 24576,
+    ):
+        self.ckpt_path = ckpt_path
         self.modality = modality.lower()
         self.domain = domain.lower()
+        self.template = template
         if self.modality not in ("text", "vision"):
             raise ValueError(f"modality must be text|vision, got {modality!r}")
         if self.domain not in ("arxiv", "iclr"):
             raise ValueError(f"domain must be arxiv|iclr, got {domain!r}")
 
-        log.info(f"loading PaperLens reranker: hf_repo={hf_repo} modality={modality} domain={domain}")
+        log.info(
+            f"loading PaperLens reranker: ckpt={ckpt_path} modality={modality} "
+            f"domain={domain} template={template}"
+        )
         from vllm import LLM, SamplingParams
         from transformers import AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(hf_repo, trust_remote_code=True)
-        self.llm = LLM(
-            model=hf_repo,
+        self.tokenizer = AutoTokenizer.from_pretrained(ckpt_path, trust_remote_code=True)
+        llm_kwargs = dict(
+            model=ckpt_path,
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
             dtype="bfloat16",
             trust_remote_code=True,
         )
-        # Greedy decode through the boxed-decision token.
-        # ``logprobs=5`` matches scripts/vllm_infer.py; "Accept" and "Reject"
-        # are reliably in the top-5 at position 5 for any trained PaperLens.
+        if self.modality == "vision":
+            # Cap per-prompt images conservatively; per_venue papers have ~7-14 pages.
+            llm_kwargs["limit_mm_per_prompt"] = {"image": 20}
+        self.llm = LLM(**llm_kwargs)
+
         self.sampling_params = SamplingParams(
             temperature=0.0,
             max_tokens=8,
             logprobs=5,
         )
 
-        # Verify Accept / Reject each tokenize to a single token. The lab's
-        # vllm_infer.py asserts this same invariant -- if it ever fires we
-        # need to update DECISION_TOKEN_IDX and the score-extraction logic.
         accept_ids = self.tokenizer.encode(ACCEPT_TOKEN, add_special_tokens=False)
         reject_ids = self.tokenizer.encode(REJECT_TOKEN, add_special_tokens=False)
-        assert len(accept_ids) == 1, f"'Accept' encodes to {len(accept_ids)} tokens: {accept_ids!r} (expected 1)"
-        assert len(reject_ids) == 1, f"'Reject' encodes to {len(reject_ids)} tokens: {reject_ids!r} (expected 1)"
+        assert len(accept_ids) == 1, f"'Accept' tokenizes to {len(accept_ids)}: {accept_ids!r}"
+        assert len(reject_ids) == 1, f"'Reject' tokenizes to {len(reject_ids)}: {reject_ids!r}"
         self.accept_id = accept_ids[0]
         self.reject_id = reject_ids[0]
-        log.info(f"decision token IDs: Accept={self.accept_id}, Reject={self.reject_id}")
+        log.info(f"decision tokens: Accept={self.accept_id}, Reject={self.reject_id}")
 
-    def _build_messages(self, paper: RetrievedPaper) -> list[dict]:
-        """Compose the ShareGPT-style messages list for one paper.
-
-        Returns ``[system, user]`` -- the model generates the assistant turn
-        autoregressively so we can record per-step logprobs (matches the lab
-        pipeline; do NOT prefill the assistant turn).
-        """
-        body = paper.full_text or f"# {paper.title}\n\n## Abstract\n{paper.abstract}"
+    def _build_messages(self, paper: RetrievedPaper, n_images: int) -> list[dict]:
+        body = paper.full_text or ""
         user_value = build_user_turn(
             domain=self.domain,
             title=paper.title,
             body=body,
-            n_images=0,                        # text reranker only (vision: TODO)
+            n_images=n_images,
             abstract=paper.abstract,
         )
         return [
@@ -100,41 +116,50 @@ class PaperLensReranker:
             {"role": "user", "content": user_value},
         ]
 
-    def _render_prompt(self, paper: RetrievedPaper) -> str:
-        """Apply the chat template with the model's normal generation prefix."""
-        messages = self._build_messages(paper)
+    def _render_prompt(self, paper: RetrievedPaper, n_images: int) -> str:
+        messages = self._build_messages(paper, n_images)
         return self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
 
     def score(self, papers: list[RetrievedPaper]) -> list[float]:
-        """Return ``logprob_accept[5] - logprob_reject[5]`` per paper.
+        """Return p_accept in [0, 1] per paper.
 
-        Position 5 is the literal Accept|Reject token in
-        ``Outcome: \\boxed{Accept|Reject}``. If the generation is truncated
-        before position 5 (rare for a trained model) the score falls back
-        to ``0.0`` (= no preference).
+        For vision papers, each ``paper.images`` must already be populated
+        with PIL.Image objects (call ``image_loader.load_pages(arxiv_id)``
+        upstream and attach them).
         """
         if not papers:
             return []
-        prompts = [self._render_prompt(p) for p in papers]
-        outputs = self.llm.generate(prompts, self.sampling_params)
+
+        vllm_inputs = []
+        for p in papers:
+            n_images = len(p.images) if p.images else 0
+            prompt = self._render_prompt(p, n_images)
+            req = {"prompt": prompt}
+            if self.modality == "vision" and n_images > 0:
+                req["multi_modal_data"] = {"image": list(p.images)}
+            vllm_inputs.append(req)
+
+        outputs = self.llm.generate(vllm_inputs, self.sampling_params)
+
         scores: list[float] = []
         for out in outputs:
-            per_step_logprobs = out.outputs[0].logprobs or []
-            if len(per_step_logprobs) <= DECISION_TOKEN_IDX:
-                log.warning(f"generation too short ({len(per_step_logprobs)} steps); scoring 0.0")
-                scores.append(0.0)
+            per_step = out.outputs[0].logprobs or []
+            if len(per_step) <= DECISION_TOKEN_IDX:
+                log.warning(
+                    f"generation too short ({len(per_step)} steps) for decision; "
+                    f"defaulting p_accept=0.5"
+                )
+                scores.append(0.5)
                 continue
-            step_lp = per_step_logprobs[DECISION_TOKEN_IDX]
-            la = step_lp.get(self.accept_id) if step_lp else None
-            lr = step_lp.get(self.reject_id) if step_lp else None
-            # vLLM surfaces a Logprob object with .logprob; tolerate raw floats too.
-            la_v = float(la.logprob) if hasattr(la, "logprob") else (float(la) if la is not None else -50.0)
-            lr_v = float(lr.logprob) if hasattr(lr, "logprob") else (float(lr) if lr is not None else -50.0)
-            scores.append(la_v - lr_v)
+            step_lp = per_step[DECISION_TOKEN_IDX] or {}
+            la_o = step_lp.get(self.accept_id)
+            lr_o = step_lp.get(self.reject_id)
+            la = float(la_o.logprob) if hasattr(la_o, "logprob") else (float(la_o) if la_o is not None else -50.0)
+            lr = float(lr_o.logprob) if hasattr(lr_o, "logprob") else (float(lr_o) if lr_o is not None else -50.0)
+            scores.append(_softmax2(la, lr))
         return scores
 
     def close(self) -> None:
-        # vLLM cleans up on GC; provided for symmetry
         self.llm = None

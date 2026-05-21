@@ -1,8 +1,7 @@
 """End-to-end test against a running paperlens-arxiv-server.
 
 Skipped unless ``PAPERLENS_E2E_URL`` is set (e.g. ``http://localhost:8000``).
-Requires the upstream arxiv_retriever to also be reachable per the running
-server's config.
+Requires arxiv_retriever to also be reachable per the running server's config.
 """
 from __future__ import annotations
 
@@ -22,31 +21,41 @@ def test_health():
     r.raise_for_status()
     body = r.json()
     assert body["status"] == "ok"
-    assert "reranker" in body
-    assert "retriever" in body
+    for k in ("reranker_ckpt", "ckpt_id", "retriever_url", "images_root", "cache_rows_for_ckpt"):
+        assert k in body, f"missing {k} in /health response"
 
 
-def test_search_rerank_changes_order():
+def test_search_returns_blended_results():
     url = os.environ["PAPERLENS_E2E_URL"].rstrip("/")
     payload = {
         "query": "sparse attention transformer",
-        "topk_retrieve": 100,
-        "topk_rerank": 10,
-        "upper_bound_datetime": "2024-01-01",
+        "k": 10,
     }
-    r = requests.post(f"{url}/search", json=payload, timeout=120)
+    r = requests.post(f"{url}/search", json=payload, timeout=600)
     r.raise_for_status()
     body = r.json()
 
+    assert body["n_retrieved"] > 0
     assert body["n_returned"] == min(10, body["n_retrieved"])
     assert len(body["results"]) == body["n_returned"]
+    assert body["n_cache_hits"] + body["n_inferred"] == body["n_retrieved"]
 
-    # The reranker should be doing _something_: at least one paper should not
-    # be at the same (rerank_position, retriever_position).
-    moved = [p for p in body["results"]
-             if p["rerank_position"] != p["retriever_position"]]
-    assert moved, "reranker left ordering identical -- check reranker config"
+    # Sort invariant: results sorted by blend_score desc
+    blends = [r["blend_score"] for r in body["results"]]
+    assert blends == sorted(blends, reverse=True), "results not sorted by blend_score"
 
-    # accept_score should be monotonically non-increasing in rerank_position
-    scores = [p["accept_score"] for p in body["results"]]
-    assert scores == sorted(scores, reverse=True), "results not sorted by accept_score"
+    # p_accept in [0,1]
+    for p in body["results"]:
+        assert 0.0 <= p["p_accept"] <= 1.0
+
+
+def test_repeat_query_hits_cache():
+    """Second identical call should have n_inferred=0 (everything cached)."""
+    url = os.environ["PAPERLENS_E2E_URL"].rstrip("/")
+    payload = {"query": "attention is all you need", "k": 5}
+    requests.post(f"{url}/search", json=payload, timeout=600).raise_for_status()
+    r = requests.post(f"{url}/search", json=payload, timeout=60)
+    r.raise_for_status()
+    body = r.json()
+    assert body["n_inferred"] == 0, "second call should be 100% cache hits"
+    assert body["n_cache_hits"] == body["n_retrieved"]

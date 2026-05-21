@@ -1,22 +1,29 @@
 # paperlens-arxiv-server
 
-PaperLens reranker stacked on top of [arxiv_retriever](https://github.com/SachinKonan/arxiv_retriever) —
-returns arXiv search results sorted by **predicted acceptance probability** (the
-PaperLens accept-vs-reject logit gap) instead of raw cosine similarity.
+PaperLens **vision** reranker stacked on top of [arxiv_retriever](https://github.com/SachinKonan/arxiv_retriever) —
+serves arXiv search results sorted by `0.3·z(retriever_score) + 0.7·p_accept`
+where `p_accept` is PaperLens-V's softmax([logp_accept, logp_reject]) over the
+boxed-decision token. Mirrors the litsearch reranking experiment in
+[`paperlens-training-and-inference/tmp_latex_dir/RANKER.md`](../paperlens-training-and-inference/docs).
 
 ```
-client → POST /search {query, topk_retrieve=100, topk_rerank=10, upper_bound_datetime?}
+user → POST /search {query, k <= 200}
   paperlens-arxiv-server :8000
-    ├── arxiv_retriever HTTP :8001  → top-K by FAISS cosine (default 100)
-    └── PaperLens vLLM (3B-text-arxiv default)
-            score = logprob(Accept) − logprob(Reject)
-  → sort by score desc, return top-N
+    1) retriever.retrieve(query, topk=200)            → 200 candidates by FAISS cosine
+    2) cache.get(ckpt_id, arxiv_ids)                  → partition into hits / misses
+    3) reranker.score(misses) on H100/A100 (vLLM)     → p_accept for new papers
+    4) cache.put(misses) and read-through next time
+    5) rank = 0.3·z(retriever_score) + 0.7·p_accept   (per RANKER.md §5.2)
+    → return top-k
 ```
 
-The default reranker model is the smallest PaperLens repo
-([`skonan/paperlens-3b-text-arxiv`](https://huggingface.co/skonan/paperlens-3b-text-arxiv));
-override via `configs/server.yaml` to use any of the other 7
-([PaperLens HF collection](https://huggingface.co/collections/skonan/paperlens-6a0c79da423c3a436b7f6b1a)).
+The default reranker is **PaperLens-V-3B** at the local ckpt
+`saves/.../arxiv_train/small/arxiv_21k_vision_3b/checkpoint-5236` (or the
+published HF repo `skonan/paperlens-3b-vision-arxiv`). Override via
+`configs/server.yaml`.
+
+The default retriever is **Qwen3-Embedding-0.6B FAISS over the per_venue 80K
+subset** — same indexes used in the offline litsearch reranking eval.
 
 ---
 
@@ -25,15 +32,19 @@ override via `configs/server.yaml` to use any of the other 7
 ```
 paperlens-arxiv-server/
 ├── pyproject.toml
-├── configs/server.yaml          # reranker model, ports, top-K defaults
-├── scripts/launch_local.sh      # spins up arxiv_retriever + this server
+├── configs/server.yaml             # reranker ckpt, retriever URL, blend weights, cache db
+├── scripts/
+│   ├── launch_local.sh             # spins up arxiv_retriever + this server
+│   └── bootstrap_cache_from_litsearch.py   # pre-load p_accept from RANKER.md §6.1 parquet
 ├── src/paperlens_arxiv_server/
-│   ├── server.py                # FastAPI /search + /health
-│   ├── reranker.py              # vLLM-loaded PaperLens scorer
-│   ├── retriever_client.py      # HTTP client for arxiv_retriever
-│   └── prompts.py               # Verbatim PROMPT_ARXIV / PROMPT_ICLR
-├── tests/{test_reranker.py, test_e2e.py}
-└── external/arxiv_retriever/    # git submodule
+│   ├── server.py                   # FastAPI /search + /health
+│   ├── reranker.py                 # vLLM-loaded PaperLens-V; p_accept softmax
+│   ├── retriever_client.py         # HTTP client for arxiv_retriever
+│   ├── image_loader.py             # data/images_arxiv/<arxiv_id>/page_*.png → PIL list
+│   ├── cache.py                    # SQLite p_accept cache (online + bootstrap)
+│   └── prompts.py                  # PROMPT_ARXIV / PROMPT_ICLR
+├── tests/{test_reranker.py, test_e2e.py, test_cache.py}
+└── external/arxiv_retriever/       # git submodule (per_venue configs added to configs/retrieval/)
 ```
 
 ---
@@ -67,11 +78,20 @@ to share a GPU with the retriever.
 ## Run
 
 ```bash
-# Both services in one go (foreground); set PAPERLENS_BG=1 for background.
-bash scripts/launch_local.sh
+# 1) (one-time) Pre-load the cache from the offline litsearch predictions
+#    -> 28,664 papers cached for ~36% of the per_venue 80K corpus before the first query
+python scripts/bootstrap_cache_from_litsearch.py \
+    --parquet /scratch/gpfs/ZHUANGL/sk7524/litsearch_eval/passover/predictions_3b.parquet \
+    --ckpt_path /scratch/gpfs/ZHUANGL/sk7524/LLaMA-Factory-AutoReviewer/saves/.../arxiv_21k_vision_3b/checkpoint-5236 \
+    --db_path ./cache/p_accept.sqlite
 
-# Or run manually:
-#   (in conda) bash external/arxiv_retriever/src/arxiv_retriever/server/retrieval_launch.sh ...
+# 2) Start both services
+bash scripts/launch_local.sh                  # foreground, or PAPERLENS_BG=1 for bg
+
+# Or run them manually:
+#   (in conda) bash external/arxiv_retriever/src/arxiv_retriever/server/retrieval_launch.sh \
+#                      external/arxiv_retriever/configs/retrieval/qwen3_06b_per_venue.yaml \
+#                      server.port=8001
 #   (in uv)    paperlens-arxiv-server --config configs/server.yaml
 ```
 
@@ -82,8 +102,7 @@ curl -sf http://localhost:8000/health | jq
 
 curl -sf -X POST http://localhost:8000/search -H 'content-type: application/json' -d '{
   "query": "sparse attention transformer",
-  "topk_retrieve": 100,
-  "topk_rerank": 10,
+  "k": 10,
   "upper_bound_datetime": "2024-01-01"
 }' | jq
 ```
@@ -92,35 +111,74 @@ Response format:
 
 ```json
 {
-  "query": "...",
-  "n_retrieved": 20,
-  "n_returned": 5,
+  "query": "sparse attention transformer",
+  "n_retrieved": 200,
+  "n_returned": 10,
+  "n_cache_hits": 174,
+  "n_inferred": 26,
   "results": [
     {
-      "paper_id": "...",
+      "paper_id": "2311.04567",
       "title": "...",
       "abstract": "...",
-      "accept_score": 2.34,         // logprob(Accept) − logprob(Reject)
-      "retriever_score": 0.87,
+      "p_accept": 0.82,            // softmax([logp_accept, logp_reject]) in [0,1]
+      "retriever_score": 0.71,
+      "blend_score": 0.71,         // 0.3 * z(retriever_score) + 0.7 * p_accept
       "rerank_position": 0,
       "retriever_position": 11,
-      "submission_date": "2023-11-12",
-      "arxiv_id": "2311.04567"
+      "cache_hit": true,
+      "submission_date": "2023-11-12"
     }
   ]
 }
 ```
+
+`n_inferred` is how many of the 200 retrieved papers needed fresh vLLM inference;
+the rest came from the SQLite cache. A repeated identical query will return
+`n_inferred=0` and respond sub-second.
 
 ---
 
 ## Tests
 
 ```bash
-# Reranker smoke (loads vLLM, ~30s)
-PAPERLENS_TEST_HF_REPO=skonan/paperlens-3b-text-arxiv \
+# Cache unit tests (pure Python, no GPU)
+uv run pytest tests/test_cache.py -v
+
+# Reranker smoke (loads vLLM, ~1 min on H100; vision mode needs sample images)
+PAPERLENS_TEST_CKPT_PATH=<local path or HF repo> \
+PAPERLENS_TEST_MODALITY=text \
   uv run pytest tests/test_reranker.py -v
 
 # End-to-end (assumes both services are running per scripts/launch_local.sh)
 PAPERLENS_E2E_URL=http://localhost:8000 \
   uv run pytest tests/test_e2e.py -v
 ```
+
+## Static assets
+
+The server reads (never writes) these external resources -- collect them once
+and point the config at them:
+
+| Asset | Default path | Owner |
+|---|---|---|
+| BM25 per_venue Lucene index | `/scratch/gpfs/ZHUANGL/sk7524/arxiv_bm25_per_venue_index/` | arxiv_retriever |
+| FAISS per_venue qwen3-0.6b | `/scratch/gpfs/ZHUANGL/sk7524/arxiv_faiss_per_venue_index/qwen3_Flat.index` | arxiv_retriever |
+| arxiv metadata snapshot | `/scratch/gpfs/ZHUANGL/sk7524/SkyRL/.../arxiv-metadata-oai-snapshot.jsonl` | upstream OAI |
+| Per-paper page PNGs | `${PAPERLENS_IMAGES_ROOT}/<arxiv_id>/page_N.png` | `reconstruction.py` (or LF main repo) |
+| Reranker ckpt | from `configs/server.yaml::reranker.ckpt_path` | published HF model |
+| Cache bootstrap parquet | `/scratch/gpfs/ZHUANGL/sk7524/litsearch_eval/passover/predictions_3b.parquet` | RANKER.md §6.1 |
+
+The server creates and mutates only:
+
+| Asset | Default path | Notes |
+|---|---|---|
+| p_accept cache | `./cache/p_accept.sqlite` | Read-through; bootstrap once from the parquet above |
+
+### Image-path coherence across the ecosystem
+
+This server, `paperlens-training-and-inference` (which provides `reconstruction.py`),
+and the published HF dataset all key on the same `arxiv_id`. Two env vars line them up:
+
+- `PAPERLENS_DATA_ROOT` → wherever reconstruction.py wrote the rebuilt data tree
+- `PAPERLENS_IMAGES_ROOT` → defaults to `${PAPERLENS_DATA_ROOT}/images_arxiv`
