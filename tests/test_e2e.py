@@ -30,7 +30,7 @@ def test_search_rerank_changes_order():
     url = os.environ["PAPERLENS_E2E_URL"].rstrip("/")
     payload = {
         "query": "sparse attention transformer",
-        "topk_retrieve": 20,
+        "topk_retrieve": 100,
         "topk_rerank": 10,
         "upper_bound_datetime": "2024-01-01",
     }

@@ -19,8 +19,10 @@ reranker:
   gpu_memory_utilization: 0.6
   max_model_len: 24576
 
-# Retrieve K from upstream, rerank, return top N
+# Retrieve K from upstream, rerank, return top N.
+# 100 retrieve was the sweet spot in our reranking experiments -- 200 added
+# more reranker compute without measurably better top-10 quality.
 search:
-  default_topk_retrieve: 50
+  default_topk_retrieve: 100
   default_topk_rerank: 10
   max_topk_retrieve: 200

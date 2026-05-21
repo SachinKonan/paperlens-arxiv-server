@@ -5,9 +5,9 @@ returns arXiv search results sorted by **predicted acceptance probability** (the
 PaperLens accept-vs-reject logit gap) instead of raw cosine similarity.
 
 ```
-client → POST /search {query, topk_retrieve=50, topk_rerank=10, upper_bound_datetime?}
+client → POST /search {query, topk_retrieve=100, topk_rerank=10, upper_bound_datetime?}
   paperlens-arxiv-server :8000
-    ├── arxiv_retriever HTTP :8001  → top-K by FAISS cosine
+    ├── arxiv_retriever HTTP :8001  → top-K by FAISS cosine (default 100)
     └── PaperLens vLLM (3B-text-arxiv default)
             score = logprob(Accept) − logprob(Reject)
   → sort by score desc, return top-N
@@ -82,8 +82,8 @@ curl -sf http://localhost:8000/health | jq
 
 curl -sf -X POST http://localhost:8000/search -H 'content-type: application/json' -d '{
   "query": "sparse attention transformer",
-  "topk_retrieve": 20,
-  "topk_rerank": 5,
+  "topk_retrieve": 100,
+  "topk_rerank": 10,
   "upper_bound_datetime": "2024-01-01"
 }' | jq
 ```
