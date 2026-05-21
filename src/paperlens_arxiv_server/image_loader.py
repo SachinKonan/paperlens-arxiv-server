@@ -66,41 +66,53 @@ def resolve_images_root(explicit: Optional[str | Path] = None) -> Path:
     )
 
 
-def load_pages(
+def resolve_page_paths(
     arxiv_id: str,
     images_root: Optional[str | Path] = None,
     *,
     max_pages: int = 14,
-) -> list:
-    """Load page PNGs for ``arxiv_id``, return list of PIL.Image (capped at max_pages).
+) -> list[str]:
+    """Return numerically-sorted absolute paths to a paper's page PNGs.
 
-    Returns ``[]`` if the per-arxiv_id directory is missing or empty -- the
-    caller should skip that paper and log a warning. (For the per_venue 80K
-    corpus this should not happen in practice since the retriever indexes
-    only papers with rendered images.)
+    Cheap (no PIL load). Use this in the HTTP-client deployment where the
+    upstream ``paperlens serve`` does the actual image read via LF's
+    multimodal plugin.
+
+    Returns ``[]`` if the per-arxiv_id directory is missing or empty.
     """
     root = resolve_images_root(images_root)
     paper_dir = root / arxiv_id
     if not paper_dir.is_dir():
         log.warning(f"no image dir for arxiv_id={arxiv_id!r} under {root}")
         return []
-
     pngs = list(paper_dir.glob("page_*.png"))
     if not pngs:
         log.warning(f"no page_*.png under {paper_dir}")
         return []
+    return [str(p) for p in _numerical_page_sort(pngs)[:max_pages]]
 
-    pngs = _numerical_page_sort(pngs)[:max_pages]
 
-    # Lazy import so the module is importable in environments without Pillow
-    # (e.g. quick unit tests that mock the reranker).
+def load_pages(
+    arxiv_id: str,
+    images_root: Optional[str | Path] = None,
+    *,
+    max_pages: int = 14,
+) -> list:
+    """Load page PNGs for ``arxiv_id`` to PIL.Image (capped at max_pages).
+
+    Use this when you actually need the pixels locally (in-process vLLM,
+    not the HTTP-client path). For the HTTP client, ``resolve_page_paths``
+    is what you want.
+    """
+    paths = resolve_page_paths(arxiv_id, images_root, max_pages=max_pages)
+    if not paths:
+        return []
     from PIL import Image
-
     images = []
-    for p in pngs:
+    for p in paths:
         try:
             img = Image.open(p)
-            img.load()  # force read so the file handle can close
+            img.load()
             images.append(img)
         except Exception as e:
             log.warning(f"failed to open {p}: {e}")

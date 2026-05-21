@@ -17,12 +17,13 @@ import math
 import os
 from typing import Optional
 
+import requests
 from fastapi import FastAPI, HTTPException
 from omegaconf import OmegaConf
 from pydantic import BaseModel, Field
 
 from .cache import PAcceptCache, hash_ckpt_id
-from .image_loader import load_pages, resolve_images_root
+from .image_loader import resolve_images_root, resolve_page_paths
 from .reranker import PaperLensReranker
 from .retriever_client import ArxivRetrieverClient, RetrievedPaper
 
@@ -105,24 +106,34 @@ def _startup() -> None:
 
     _state["cfg"] = cfg
     _state["images_root"] = resolve_images_root(cfg.get("images_root"))
-    _state["ckpt_id"] = hash_ckpt_id(cfg.reranker.ckpt_path)
-    _state["cache"] = PAcceptCache(cfg.cache.db_path)
+    # ckpt_id is now derived from paperlens_serve's reported ckpt_path,
+    # not a local file (we don't load the model in this process).
     _state["retriever"] = ArxivRetrieverClient(
         base_url=cfg.retriever.base_url,
         timeout=cfg.retriever.timeout_seconds,
     )
     _state["reranker"] = PaperLensReranker(
-        ckpt_path=cfg.reranker.ckpt_path,
-        modality=cfg.reranker.modality,
+        serve_url=cfg.paperlens_serve.base_url,
         domain=cfg.reranker.domain,
-        template=cfg.reranker.template,
-        tensor_parallel_size=cfg.reranker.tensor_parallel_size,
-        gpu_memory_utilization=cfg.reranker.gpu_memory_utilization,
-        max_model_len=cfg.reranker.max_model_len,
+        modality=cfg.reranker.modality,
+        timeout_seconds=float(cfg.paperlens_serve.get("timeout_seconds", 600)),
     )
+    # Pull the upstream serve's ckpt_path so the cache key matches what
+    # paperlens-serve actually loaded (decouples our config from theirs).
+    try:
+        h = requests.get(f"{cfg.paperlens_serve.base_url}/health", timeout=10).json()
+        _state["ckpt_id"] = hash_ckpt_id(h.get("ckpt_path", cfg.paperlens_serve.base_url))
+        _state["compute_arch"] = h.get("compute_arch", "unknown")
+    except Exception as e:
+        log.warning(f"serve /health probe failed at startup: {e}")
+        _state["ckpt_id"] = hash_ckpt_id(cfg.paperlens_serve.base_url)
+        _state["compute_arch"] = "unknown"
+
+    _state["cache"] = PAcceptCache(cfg.cache.db_path)
     log.info(
         f"startup complete. ckpt_id={_state['ckpt_id']} "
         f"images_root={_state['images_root']} "
+        f"compute_arch={_state['compute_arch']} "
         f"cache_rows={_state['cache'].size(_state['ckpt_id'])}"
     )
 
@@ -182,15 +193,19 @@ def search(req: SearchRequest) -> SearchResponse:
         f"misses {len(miss_papers)} (will run vLLM)"
     )
 
-    # 3) For misses: load page images and score via vLLM
+    # 3) For misses: attach image PATHS (the upstream `paperlens serve` does
+    #    the actual image load + LF tokenization). Then score via /score.
     if miss_papers:
         for p in miss_papers:
-            p.images = load_pages(p.paper_id, _state["images_root"])
+            p.images = resolve_page_paths(p.paper_id, _state["images_root"])
         miss_scores_list = _state["reranker"].score(miss_papers)
         miss_scores = {
             p.paper_id: s for p, s in zip(miss_papers, miss_scores_list)
         }
-        _state["cache"].put(_state["ckpt_id"], miss_scores)
+        _state["cache"].put(
+            _state["ckpt_id"], miss_scores,
+            source="online", compute_arch=_state["compute_arch"],
+        )
     else:
         miss_scores = {}
 

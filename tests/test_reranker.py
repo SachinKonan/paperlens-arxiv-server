@@ -1,80 +1,151 @@
-"""Smoke test: load the vision reranker against a real PaperLens ckpt and
-score two papers. Confirms vLLM loading + DECISION_TOKEN_IDX=5 extraction +
-p_accept softmax produce sensible values.
+"""Reranker is now an HTTP client to ``paperlens serve``. Tests use a mock
+/score endpoint so they run without a GPU.
 
-Heavy: loads ~6 GB of weights into vLLM. Skipped unless env vars are set.
-
-Env:
-  PAPERLENS_TEST_CKPT_PATH   local path or HF repo id of a PaperLens ckpt
-  PAPERLENS_TEST_MODALITY    'text' or 'vision' (default 'text' -- no images needed)
-  PAPERLENS_TEST_IMAGES_DIR  required only when modality=vision; dir with page_*.png
+For an end-to-end test against a real running serve, see
+``paperlens-training-and-inference/scripts/tests/test_serve_idempotency.py``
+which gates on the ``PAPERLENS_SERVE_URL`` env var.
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional
 
 import pytest
 
-CKPT = os.environ.get("PAPERLENS_TEST_CKPT_PATH")
-MODALITY = os.environ.get("PAPERLENS_TEST_MODALITY", "text")
-IMAGES_DIR = os.environ.get("PAPERLENS_TEST_IMAGES_DIR")
-
-pytestmark = pytest.mark.skipif(
-    not CKPT,
-    reason="set PAPERLENS_TEST_CKPT_PATH to a PaperLens ckpt to run",
-)
+from paperlens_arxiv_server.reranker import PaperLensReranker
+from paperlens_arxiv_server.retriever_client import RetrievedPaper
 
 
-def test_score_two_papers():
-    from paperlens_arxiv_server.reranker import PaperLensReranker
-    from paperlens_arxiv_server.retriever_client import RetrievedPaper
+# ---------------------------------------------------------------------------
+# Mock /score server -- pure-stdlib, no GPU, no vLLM
+# ---------------------------------------------------------------------------
 
-    if MODALITY == "vision":
-        assert IMAGES_DIR, "vision mode requires PAPERLENS_TEST_IMAGES_DIR"
-        from PIL import Image
-        pngs = sorted(Path(IMAGES_DIR).glob("page_*.png"))
-        assert pngs, f"no page_*.png in {IMAGES_DIR}"
-        images = [Image.open(p) for p in pngs[:8]]
-    else:
-        images = []
+class _MockScoreHandler(BaseHTTPRequestHandler):
+    """Returns one scripted PaperScore per request paper.
 
-    rr = PaperLensReranker(
-        ckpt_path=CKPT, modality=MODALITY, domain="arxiv",
-        gpu_memory_utilization=0.7, max_model_len=8192,
-    )
+    Capture mode (server attaches `received` list): every POST request's
+    body is appended so tests can assert what the reranker sent.
+    """
 
+    server_version = "MockScore/1.0"
+
+    def log_message(self, *args, **kwargs):  # silence test output
+        pass
+
+    def do_GET(self):
+        if self.path == "/health":
+            body = {
+                "status": "ok",
+                "ckpt_path": "/mock/ckpt-1",
+                "template": "qwen2_vl",
+                "decision_token_idx": 5,
+                "compute_arch": "mock_test",
+            }
+            self._json(200, body)
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/score":
+            self._json(404, {"error": "not found"})
+            return
+        length = int(self.headers.get("content-length", 0))
+        body = json.loads(self.rfile.read(length))
+        self.server.received.append(body)
+        # Scripted scores: pre-loaded onto the server before this handler runs.
+        n = len(body["papers"])
+        scores = self.server.scripted_scores[:n]
+        self._json(200, {"scores": scores})
+
+    def _json(self, code: int, body: dict):
+        payload = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+@pytest.fixture
+def mock_serve():
+    httpd = HTTPServer(("127.0.0.1", 0), _MockScoreHandler)
+    httpd.scripted_scores = []
+    httpd.received = []
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield (httpd, f"http://127.0.0.1:{port}")
+    finally:
+        httpd.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+def test_reranker_health_probe(mock_serve):
+    _, url = mock_serve
+    rr = PaperLensReranker(serve_url=url, domain="arxiv", modality="vision")
+    assert rr.compute_arch == "mock_test"
+
+
+def test_score_returns_floats(mock_serve):
+    httpd, url = mock_serve
+    httpd.scripted_scores = [
+        {"p_accept": 0.82, "logp_accept": -0.5, "logp_reject": -2.1, "pred": "Outcome: \\boxed{Accept}"},
+        {"p_accept": 0.18, "logp_accept": -3.0, "logp_reject": -0.5, "pred": "Outcome: \\boxed{Reject}"},
+    ]
+    rr = PaperLensReranker(serve_url=url, domain="arxiv", modality="vision")
     papers = [
-        RetrievedPaper(
-            paper_id="fake-strong",
-            title="Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context",
-            abstract=(
-                "Transformers have a potential of learning longer-term dependency, but "
-                "are limited by a fixed-length context. We propose Transformer-XL that "
-                "enables learning dependency beyond a fixed length without disrupting "
-                "temporal coherence."
-            ),
-            score=0.95,
-            images=list(images),
-        ),
-        RetrievedPaper(
-            paper_id="fake-weak",
-            title="A Small Modification of Softmax",
-            abstract=(
-                "In this paper we propose a small modification of the softmax function. "
-                "We test it on MNIST and observe a 0.1% accuracy improvement, though "
-                "the result is within noise."
-            ),
-            score=0.94,
-            images=list(images),
-        ),
+        RetrievedPaper(paper_id="2305.00001", title="A", abstract="ab", score=0.9, images=["/x/page_1.png"]),
+        RetrievedPaper(paper_id="2305.00002", title="B", abstract="bc", score=0.8, images=["/x/page_1.png"]),
     ]
     scores = rr.score(papers)
-    assert len(scores) == 2
-    for s in scores:
-        assert isinstance(s, float)
-        assert 0.0 <= s <= 1.0, f"p_accept {s} not in [0,1]"
-    # Sanity: a trained reranker should rate Transformer-XL higher than a weak foil
-    assert scores[0] > scores[1] - 0.05, (
-        f"expected STRONG > WEAK (or close); got {scores[0]:.3f} vs {scores[1]:.3f}"
-    )
+    assert scores == [0.82, 0.18]
+
+
+def test_sharegpt_row_has_required_fields(mock_serve):
+    """The body the reranker POSTs must look like a paperprep-style sharegpt row:
+    system + human + gpt turns, _metadata with arxiv_id, images list."""
+    httpd, url = mock_serve
+    httpd.scripted_scores = [{"p_accept": 0.5}]
+    rr = PaperLensReranker(serve_url=url, domain="arxiv", modality="vision")
+    rr.score([RetrievedPaper(
+        paper_id="2305.00007", title="T", abstract="A", score=0.5,
+        images=["/x/page_1.png", "/x/page_2.png"],
+    )])
+    body = httpd.received[-1]
+    assert "papers" in body and len(body["papers"]) == 1
+    row = body["papers"][0]
+    assert "conversations" in row and len(row["conversations"]) >= 2
+    roles = [c["from"] for c in row["conversations"]]
+    assert "system" in roles and "human" in roles
+    # vision rows must carry image paths
+    assert row.get("images") == ["/x/page_1.png", "/x/page_2.png"]
+    assert row["_metadata"]["arxiv_id"] == "2305.00007"
+    # human turn should contain the ARXIV prompt + the abstract + N <image>
+    human = next(c["value"] for c in row["conversations"] if c["from"] == "human")
+    assert "acceptance outcome" in human
+    assert "## Abstract\nA" in human
+    assert human.count("<image>") == 2
+
+
+def test_iclr_prompt_used_when_domain_is_iclr(mock_serve):
+    httpd, url = mock_serve
+    httpd.scripted_scores = [{"p_accept": 0.5}]
+    rr = PaperLensReranker(serve_url=url, domain="iclr", modality="vision")
+    rr.score([RetrievedPaper(
+        paper_id="xyz", title="T", abstract="A", score=0.5, images=["/x/page_1.png"],
+    )])
+    human = next(c["value"] for c in httpd.received[-1]["papers"][0]["conversations"] if c["from"] == "human")
+    assert "acceptance outcome at ICLR" in human
+
+
+def test_empty_papers_returns_empty(mock_serve):
+    _, url = mock_serve
+    rr = PaperLensReranker(serve_url=url, domain="arxiv", modality="vision")
+    assert rr.score([]) == []
