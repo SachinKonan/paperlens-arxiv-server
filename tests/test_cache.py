@@ -47,7 +47,7 @@ def test_bootstrap_skips_existing(tmp_path: Path):
         return  # skip if pandas not installed
 
     cache = PAcceptCache(tmp_path / "p.sqlite")
-    cache.put("ckpt", {"shared_id": 0.99}, source="online")    # already there
+    cache.put("ckpt", {"shared_id": 0.99}, source="online", compute_arch="gputest_gpu80")  # already there
 
     pq_path = tmp_path / "p.parquet"
     pd.DataFrame({
@@ -59,3 +59,14 @@ def test_bootstrap_skips_existing(tmp_path: Path):
     assert inserted == 1                              # only new_id inserted
     assert cache.get("ckpt", ["shared_id"]) == {"shared_id": 0.99}    # preserved
     assert cache.get("ckpt", ["new_id"]) == {"new_id": 0.42}
+
+
+def test_compute_arch_tagged(tmp_path: Path):
+    """Cache must record which hardware produced each score for auditability."""
+    cache = PAcceptCache(tmp_path / "p.sqlite")
+    cache.put("ckpt", {"a": 0.1}, source="online", compute_arch="gputest_gpu80")
+    cache.put("ckpt", {"b": 0.2}, source="bootstrap", compute_arch="pli_h100_sxm")
+    rows = list(cache.conn.execute(
+        "SELECT arxiv_id, source, compute_arch FROM p_accept WHERE reranker_ckpt_id='ckpt' ORDER BY arxiv_id"
+    ))
+    assert rows == [("a", "online", "gputest_gpu80"), ("b", "bootstrap", "pli_h100_sxm")]

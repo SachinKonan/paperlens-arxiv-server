@@ -33,10 +33,25 @@ CREATE TABLE IF NOT EXISTS p_accept (
     p_accept         REAL NOT NULL,
     computed_at      TEXT NOT NULL,
     source           TEXT NOT NULL DEFAULT 'online',
+    compute_arch     TEXT NOT NULL DEFAULT 'unknown',
     PRIMARY KEY (reranker_ckpt_id, arxiv_id)
 );
 CREATE INDEX IF NOT EXISTS idx_arxiv_id ON p_accept(arxiv_id);
 """
+
+# NOTE on cross-architecture drift:
+# vLLM picks attention kernels per-GPU-class (e.g. H100/SXM vs gpu80 partition
+# nodes). For the same model + same inputs + same vLLM/transformers version,
+# bf16 logits drift on the order of:
+#     mean   |Δp_accept| ~ 0.02
+#     median |Δp_accept| ~ 0.01
+#     max    |Δp_accept| ~ 0.21   (concentrated at p≈0.5)
+#     binary Accept/Reject flip rate ~ 1.9%
+#     Pearson r(scores_archA, scores_archB) ~ 0.994
+# This means top-K reranking is preserved across architectures (recall@K
+# essentially unchanged) but absolute p_accept values can differ. Tag every
+# cache row with compute_arch so we can audit and, if needed, invalidate
+# rows produced on a different architecture than the running deployment.
 
 
 def hash_ckpt_id(ckpt_path: str | Path) -> str:
@@ -97,16 +112,30 @@ class PAcceptCache:
                 out[aid] = float(p)
         return out
 
-    def put(self, ckpt_id: str, scores: dict[str, float], *, source: str = "online") -> int:
-        """Atomic batched upsert. Returns the number of rows written."""
+    def put(
+        self,
+        ckpt_id: str,
+        scores: dict[str, float],
+        *,
+        source: str = "online",
+        compute_arch: str = "unknown",
+    ) -> int:
+        """Atomic batched upsert. Returns the number of rows written.
+
+        ``compute_arch`` should identify the hardware class that produced the
+        scores (e.g. 'pli_h100_sxm', 'gputest_gpu80'). Cross-arch scores drift
+        ~0.02 mean / 0.21 max for the same model + inputs -- see the schema
+        comment for full numbers.
+        """
         if not scores:
             return 0
         now = _dt.datetime.utcnow().isoformat(timespec="seconds")
-        rows = [(ckpt_id, aid, float(p), now, source) for aid, p in scores.items()]
+        rows = [(ckpt_id, aid, float(p), now, source, compute_arch) for aid, p in scores.items()]
         cur = self.conn.cursor()
         cur.executemany(
-            "INSERT OR REPLACE INTO p_accept (reranker_ckpt_id, arxiv_id, p_accept, computed_at, source) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO p_accept "
+            "(reranker_ckpt_id, arxiv_id, p_accept, computed_at, source, compute_arch) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             rows,
         )
         self.conn.commit()
@@ -120,6 +149,7 @@ class PAcceptCache:
         arxiv_id_col: str = "arxiv_id",
         p_accept_col: str | None = None,
         source: str = "bootstrap",
+        compute_arch: str = "pli_h100_sxm",
     ) -> int:
         """One-time pre-load from a Parquet file.
 
@@ -158,5 +188,5 @@ class PAcceptCache:
             for _, row in df.iterrows()
             if row[arxiv_id_col] not in existing
         }
-        self.put(ckpt_id, scores, source=source)
+        self.put(ckpt_id, scores, source=source, compute_arch=compute_arch)
         return len(scores)

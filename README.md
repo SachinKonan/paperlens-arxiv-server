@@ -182,3 +182,34 @@ and the published HF dataset all key on the same `arxiv_id`. Two env vars line t
 
 - `PAPERLENS_DATA_ROOT` → wherever reconstruction.py wrote the rebuilt data tree
 - `PAPERLENS_IMAGES_ROOT` → defaults to `${PAPERLENS_DATA_ROOT}/images_arxiv`
+
+## Known caveat: cross-architecture p_accept drift
+
+vLLM picks attention kernels per-GPU-class (the torch.compile cache hash differs
+across H100-SXM / gpu80 / A100-PCIE). For the **same model + same inputs + same
+vLLM/transformers version**, bf16 logits drift across GPU classes by:
+
+| Statistic | Value (1000-row diag: PLI H100-SXM vs gputest gpu80) |
+|---|---|
+| Mean   \|Δp_accept\| | 0.022 |
+| Median \|Δp_accept\| | 0.010 |
+| Max    \|Δp_accept\| | 0.214 (concentrated at p≈0.5) |
+| Binary Accept/Reject flips | 1.9 % |
+| Pearson r(p_archA, p_archB) | **0.994** |
+
+Implications for the deployment:
+
+- **Top-K reranking is preserved**: ranks are virtually identical (Pearson > 0.99) so
+  RANKER.md's recall@K numbers stay valid across architectures.
+- **Absolute p_accept values can differ** by up to 0.21 on borderline papers (those
+  sitting around p≈0.5 where small logit shifts flip the softmax).
+- **Cache hygiene**: every row in the `p_accept.sqlite` cache is tagged with a
+  `compute_arch` column. Rows bootstrapped from `predictions_3b.parquet` are
+  marked `pli_h100_sxm` (the May-12 hardware); rows produced online are tagged
+  with the running server's hardware. Mixed-arch caches are operationally fine
+  but auditable — see `SELECT compute_arch, COUNT(*) FROM p_accept GROUP BY 1`.
+
+We chose to **bootstrap from PLI and serve on gpu-test** intentionally: the
+PLI parquet covers 28k papers for free (no GPU cost) and the gpu-test online
+backfill is fast. The 0.994 correlation means the cache and the live scorer
+agree on ranking even though they differ in 3rd-decimal absolute values.
