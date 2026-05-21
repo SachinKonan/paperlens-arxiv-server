@@ -151,8 +151,9 @@ def health() -> dict:
     cfg = _state["cfg"]
     return {
         "status": "ok",
-        "reranker_ckpt": cfg.reranker.ckpt_path,
+        "paperlens_serve_url": cfg.paperlens_serve.base_url,
         "ckpt_id": _state["ckpt_id"],
+        "compute_arch": _state["compute_arch"],
         "retriever_url": cfg.retriever.base_url,
         "images_root": str(_state["images_root"]),
         "cache_db": cfg.cache.db_path,
