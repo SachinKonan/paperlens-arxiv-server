@@ -1,0 +1,26 @@
+# paperlens-arxiv-server runtime config
+
+server:
+  host: 0.0.0.0
+  port: 8000
+
+# Upstream arxiv_retriever HTTP endpoint
+retriever:
+  base_url: http://localhost:8001
+  timeout_seconds: 30.0
+
+# Reranker model (any of the 8 PaperLens HF repos; 3B-text-arxiv is the smallest)
+reranker:
+  hf_repo: skonan/paperlens-3b-text-arxiv
+  modality: text                 # text | vision
+  domain: arxiv                  # arxiv | iclr  (drives the prompt template)
+  # vLLM engine settings
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.6
+  max_model_len: 24576
+
+# Retrieve K from upstream, rerank, return top N
+search:
+  default_topk_retrieve: 50
+  default_topk_rerank: 10
+  max_topk_retrieve: 200

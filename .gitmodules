@@ -1,0 +1,3 @@
+[submodule "external/arxiv_retriever"]
+	path = external/arxiv_retriever
+	url = https://github.com/SachinKonan/arxiv_retriever.git
