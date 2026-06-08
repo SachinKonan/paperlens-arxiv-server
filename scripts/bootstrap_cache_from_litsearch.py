@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""One-shot pre-load of the SQLite p_accept cache from a litsearch parquet.
+"""One-shot pre-load of the SQLite p_accept cache from a predictions parquet.
 
-RANKER.md §6.1 produced exact offline p_accept values for the 28,664-paper
-litsearch hard-query candidate pool. Those are byte-identical to what online
-vLLM would compute (greedy decode + 2-token softmax at the boxed slot), so we
-can drop them straight into the deployment cache and skip ~28K papers' worth
-of GPU work.
+The offline LitSearch run produced exact p_accept values for ~28,664 papers in
+the per_venue candidate pool, byte-identical to what online vLLM would compute
+(greedy decode + 2-token softmax at the boxed slot). Dropping them into the
+SQLite cache skips that GPU work on first query. The parquets ride along in
+the HF index bundle (``skonan/PaperLens-arXiv-embeddings`` -> ``cache/``);
+``paperlens serve --with-retrieval`` runs this script automatically once the
+scorer is up.
 
-Run this ONCE per deployment, AFTER setting the ckpt_path in
-configs/server.yaml. Safe to re-run: existing (ckpt_id, arxiv_id) rows are
-skipped (so online-computed scores are never overwritten).
+Run it ONCE per deployment, after the scorer is serving (the ckpt_path comes
+from its /health). Safe to re-run: existing (ckpt_id, arxiv_id) rows are
+preserved (online-computed scores never overwritten).
 
 Example:
 
     python scripts/bootstrap_cache_from_litsearch.py \\
-        --parquet /scratch/gpfs/ZHUANGL/sk7524/litsearch_eval/passover/predictions_3b.parquet \\
-        --ckpt_path /scratch/gpfs/ZHUANGL/sk7524/LLaMA-Factory-AutoReviewer/saves/.../checkpoint-5236 \\
+        --parquet <hf_cache>/datasets--skonan--PaperLens-arXiv-embeddings/.../cache/predictions_3b.parquet \\
+        --ckpt_path <ckpt_path the scorer reports at /health> \\
         --db_path ./cache/p_accept.sqlite
 
 The --ckpt_path is hashed the same way the server hashes it, so the

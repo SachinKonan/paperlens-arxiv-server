@@ -34,7 +34,7 @@ reranker:
 #   1. this explicit value (uncomment + set), OR
 #   2. PAPERLENS_IMAGES_ROOT env var, OR
 #   3. ${PAPERLENS_DATA_ROOT}/images_arxiv
-# images_root: /scratch/gpfs/ZHUANGL/sk7524/LLaMA-Factory-AutoReviewer/data/images_arxiv
+# images_root: /path/to/images_arxiv
 
 cache:
   db_path: ./cache/p_accept.sqlite
@@ -43,3 +43,6 @@ search:
   default_blend: default              # 'default' = the documented blend; 'p_accept_only' = no z-norm
   blend_weight_retriever: 0.3
   blend_weight_p_accept: 0.7
+  rerank_pool: 50                     # /search_compare: retrieve+rerank this many, then show
+                                      # base top-20 (retriever order) vs reranked top-20 (blend)
+  compare_top: 20                     # rows per column in the base-vs-reranked view

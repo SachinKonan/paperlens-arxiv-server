@@ -15,10 +15,12 @@ from __future__ import annotations
 import logging
 import math
 import os
+from pathlib import Path
 from typing import Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from omegaconf import OmegaConf
 from pydantic import BaseModel, Field
 
@@ -42,6 +44,11 @@ log = logging.getLogger("paperlens-arxiv-server")
 class SearchRequest(BaseModel):
     query: str
     k: int = Field(default=10, ge=1, le=200, description="Number of reranked results to return (<=200)")
+    rerank_pool: Optional[int] = Field(
+        default=None, ge=1, le=200,
+        description="How many retrieved papers to rerank. Defaults to retriever.topk_retrieve "
+                    "for /search, and search.rerank_pool for /search_compare.",
+    )
     upper_bound_datetime: Optional[str] = Field(
         default=None,
         description="ISO date; arxiv_retriever filters to papers submitted on/before this date",
@@ -74,9 +81,19 @@ class SearchResponse(BaseModel):
     query: str
     n_retrieved: int
     n_returned: int
-    n_cache_hits: int                   # of the 200, how many had a cached p_accept
-    n_inferred: int                     # of the 200, how many we ran through vLLM this request
+    n_cache_hits: int                   # of the pool, how many had a cached p_accept
+    n_inferred: int                     # of the pool, how many we ran through vLLM this request
     results: list[RankedPaper]
+
+
+class CompareResponse(BaseModel):
+    """Side-by-side for the search UI: the SAME reranked pool shown two ways."""
+    query: str
+    pool: int                           # how many papers were retrieved + reranked
+    n_cache_hits: int
+    n_inferred: int
+    base: list[RankedPaper]             # retriever order (top compare_top); rerank_position shows where each moved
+    reranked: list[RankedPaper]         # blend/p_accept order (top compare_top); retriever_position shows origin
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +102,15 @@ class SearchResponse(BaseModel):
 
 app = FastAPI(title="paperlens-arxiv-server")
 _state: dict = {}
+_UI_DIR = Path(__file__).resolve().parent / "ui"
+
+
+@app.get("/")
+def root():
+    idx = _UI_DIR / "index.html"
+    if not idx.exists():
+        raise HTTPException(500, f"UI not bundled: {idx}")
+    return FileResponse(idx)
 
 
 def _zscore(xs: list[float]) -> list[float]:
@@ -161,18 +187,18 @@ def health() -> dict:
     }
 
 
-@app.post("/search", response_model=SearchResponse)
-def search(req: SearchRequest) -> SearchResponse:
+def _rank_pool(req: SearchRequest, pool: int) -> tuple[list[RankedPaper], int, int]:
+    """Retrieve `pool` papers, rerank them (cached p_accept + vLLM on misses),
+    blend, and return every paper as a RankedPaper carrying BOTH its
+    retriever_position (retriever order) and rerank_position (blend order, global
+    within the pool). Records are returned in retriever order. Also returns
+    (n_cache_hits, n_inferred). Raises HTTPException(502) if the retriever fails.
+    """
     cfg = _state["cfg"]
-    topk_retrieve = int(cfg.retriever.topk_retrieve)
-
-    log.info(f"query={req.query!r} k={req.k} blend={req.blend or 'default'}")
-
-    # 1) Retrieve fixed top-200
     try:
         papers = _state["retriever"].retrieve(
             query=req.query,
-            topk=topk_retrieve,
+            topk=pool,
             upper_bound_datetime=req.upper_bound_datetime,
             exclude_title=req.exclude_title,
         )
@@ -180,78 +206,85 @@ def search(req: SearchRequest) -> SearchResponse:
         log.exception("retriever failed")
         raise HTTPException(502, f"arxiv_retriever error: {e}")
     if not papers:
-        return SearchResponse(
-            query=req.query, n_retrieved=0, n_returned=0,
-            n_cache_hits=0, n_inferred=0, results=[],
-        )
+        return [], 0, 0
 
-    # 2) Partition into cache hits + misses
+    # cache hits + misses; score misses via the upstream reranker
     arxiv_ids = [p.paper_id for p in papers]
     cached = _state["cache"].get(_state["ckpt_id"], arxiv_ids)
     miss_papers = [p for p in papers if p.paper_id not in cached]
-    log.info(
-        f"retrieved {len(papers)}, cache hits {len(cached)}, "
-        f"misses {len(miss_papers)} (will run vLLM)"
-    )
-
-    # 3) For misses: attach image PATHS (the upstream `paperlens serve` does
-    #    the actual image load + LF tokenization). Then score via /score.
+    log.info(f"retrieved {len(papers)}, cache hits {len(cached)}, misses {len(miss_papers)}")
     if miss_papers:
         for p in miss_papers:
             p.images = resolve_page_paths(p.paper_id, _state["images_root"])
         miss_scores_list = _state["reranker"].score(miss_papers)
-        miss_scores = {
-            p.paper_id: s for p, s in zip(miss_papers, miss_scores_list)
-        }
-        _state["cache"].put(
-            _state["ckpt_id"], miss_scores,
-            source="online", compute_arch=_state["compute_arch"],
-        )
+        miss_scores = {p.paper_id: s for p, s in zip(miss_papers, miss_scores_list)}
+        _state["cache"].put(_state["ckpt_id"], miss_scores,
+                            source="online", compute_arch=_state["compute_arch"])
     else:
         miss_scores = {}
-
     p_accept_by_id: dict[str, float] = {**cached, **miss_scores}
 
-    # 4) Compute blended ranking score
-    retriever_scores = [p.score for p in papers]
-    z = _zscore(retriever_scores)
+    # blended ranking score
+    z = _zscore([p.score for p in papers])
     blend_mode = (req.blend or cfg.search.get("default_blend", "default")).lower()
-    blends: list[float] = []
     if blend_mode == "p_accept_only":
         blends = [p_accept_by_id.get(p.paper_id, 0.5) for p in papers]
-    else:  # 'default' or anything else -> documented blend
+    else:
         wr = float(cfg.search.blend_weight_retriever)
         wp = float(cfg.search.blend_weight_p_accept)
-        for zi, p in zip(z, papers):
-            pa = p_accept_by_id.get(p.paper_id, 0.5)
-            blends.append(wr * zi + wp * pa)
+        blends = [wr * zi + wp * p_accept_by_id.get(p.paper_id, 0.5)
+                  for zi, p in zip(z, papers)]
 
-    # 5) Sort by blend desc, return top-k
-    ranked = sorted(
-        enumerate(zip(papers, blends)),
-        key=lambda kv: -kv[1][1],
-    )
-    results = []
-    for new_pos, (retr_pos, (p, b)) in enumerate(ranked[: req.k]):
-        results.append(RankedPaper(
-            paper_id=p.paper_id,
-            title=p.title,
-            abstract=p.abstract,
+    # global rerank_position = rank of each paper when the pool is sorted by blend
+    order = sorted(range(len(papers)), key=lambda i: -blends[i])
+    rerank_pos = {i: rank for rank, i in enumerate(order)}
+
+    records = [
+        RankedPaper(
+            paper_id=p.paper_id, title=p.title, abstract=p.abstract,
             p_accept=p_accept_by_id.get(p.paper_id, 0.5),
-            retriever_score=p.score,
-            blend_score=b,
-            rerank_position=new_pos,
-            retriever_position=retr_pos,
-            cache_hit=p.paper_id in cached,
-            submission_date=p.submission_date,
-        ))
+            retriever_score=p.score, blend_score=blends[i],
+            rerank_position=rerank_pos[i], retriever_position=i,
+            cache_hit=p.paper_id in cached, submission_date=p.submission_date,
+        )
+        for i, p in enumerate(papers)
+    ]
+    return records, len(cached), len(miss_papers)
+
+
+@app.post("/search", response_model=SearchResponse)
+def search(req: SearchRequest) -> SearchResponse:
+    cfg = _state["cfg"]
+    pool = req.rerank_pool or int(cfg.retriever.topk_retrieve)
+    log.info(f"query={req.query!r} k={req.k} pool={pool} blend={req.blend or 'default'}")
+    records, hits, inferred = _rank_pool(req, pool)
+    if not records:
+        return SearchResponse(query=req.query, n_retrieved=0, n_returned=0,
+                              n_cache_hits=0, n_inferred=0, results=[])
+    ranked = sorted(records, key=lambda r: r.rerank_position)[: req.k]
     return SearchResponse(
-        query=req.query,
-        n_retrieved=len(papers),
-        n_returned=len(results),
-        n_cache_hits=len(cached),
-        n_inferred=len(miss_papers),
-        results=results,
+        query=req.query, n_retrieved=len(records), n_returned=len(ranked),
+        n_cache_hits=hits, n_inferred=inferred, results=ranked,
+    )
+
+
+@app.post("/search_compare", response_model=CompareResponse)
+def search_compare(req: SearchRequest) -> CompareResponse:
+    """Base vs reranked, side by side. Retrieves + reranks a middle pool
+    (search.rerank_pool, default 50) and returns the top compare_top of each
+    ordering, so the UI can show how PaperLens reorders the retriever's hits.
+    """
+    cfg = _state["cfg"]
+    pool = req.rerank_pool or int(cfg.search.get("rerank_pool", 50))
+    top = int(cfg.search.get("compare_top", 20))
+    log.info(f"[compare] query={req.query!r} pool={pool} top={top} blend={req.blend or 'default'}")
+    records, hits, inferred = _rank_pool(req, pool)
+    base = sorted(records, key=lambda r: r.retriever_position)[:top]
+    reranked = sorted(records, key=lambda r: r.rerank_position)[:top]
+    return CompareResponse(
+        query=req.query, pool=len(records),
+        n_cache_hits=hits, n_inferred=inferred,
+        base=base, reranked=reranked,
     )
 
 

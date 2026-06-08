@@ -33,3 +33,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/paperlens_arxiv_server"]
+
+[tool.hatch.build]
+include = ["src/paperlens_arxiv_server/ui/**"]
