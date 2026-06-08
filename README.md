@@ -44,8 +44,10 @@ HTTP API.
 The retriever is **conda** (faiss-gpu is conda-only); this server is **uv/pip**.
 
 ```bash
-git clone --recurse-submodules <this repo> paperlens-arxiv-server
-cd paperlens-arxiv-server
+# Run from the paperlens-arxiv-server directory: it's already present
+# inside the PaperLens release (`cd PaperLens/tools/paperlens-arxiv-server`),
+# or clone the standalone repo with `--recurse-submodules` to pick up
+# external/arxiv_retriever.
 
 # arxiv_retriever conda env (one-off; needs faiss-gpu + pyserini + Java 21)
 conda env create -f external/arxiv_retriever/conda-env.yml
