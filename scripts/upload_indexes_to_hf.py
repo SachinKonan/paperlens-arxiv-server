@@ -25,7 +25,7 @@ Usage:
         --corpus /path/to/arxiv_wikiformat_per_venue.jsonl \\
         [--pred3b /path/to/predictions_3b.parquet] \\
         [--pred7b /path/to/predictions_7b.parquet] \\
-        [--repo  skonan/PaperLens-arXiv-embeddings] \\
+        [--repo  skonan/PaperScorer-arXiv-embeddings] \\
         [--private] [--dry-run]
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ import os
 import sys
 from pathlib import Path
 
-DEFAULT_REPO = "skonan/PaperLens-arXiv-embeddings"
+DEFAULT_REPO = "skonan/PaperScorer-arXiv-embeddings"
 
 # Bundle layout (path_in_repo) -- keep in sync with orchestrator retrieval.BUNDLE.
 DEST = {

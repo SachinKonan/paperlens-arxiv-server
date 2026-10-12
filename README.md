@@ -61,7 +61,7 @@ uv sync                              # creates .venv, installs the package + dep
 ### 2. Indexes + p_accept cache seed (from Hugging Face)
 
 `paperlens setup --with-retrieval` clones what it needs from the
-[`skonan/PaperLens-arXiv-embeddings`](https://huggingface.co/datasets/skonan/PaperLens-arXiv-embeddings)
+[`skonan/PaperScorer-arXiv-embeddings`](https://huggingface.co/datasets/skonan/PaperScorer-arXiv-embeddings)
 dataset into your HF cache:
 
 | path in repo | what |

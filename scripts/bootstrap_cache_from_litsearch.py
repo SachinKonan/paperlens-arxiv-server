@@ -5,7 +5,7 @@ The offline LitSearch run produced exact p_accept values for ~28,664 papers in
 the per_venue candidate pool, byte-identical to what online vLLM would compute
 (greedy decode + 2-token softmax at the boxed slot). Dropping them into the
 SQLite cache skips that GPU work on first query. The parquets ride along in
-the HF index bundle (``skonan/PaperLens-arXiv-embeddings`` -> ``cache/``);
+the HF index bundle (``skonan/PaperScorer-arXiv-embeddings`` -> ``cache/``);
 ``paperlens serve --with-retrieval`` runs this script automatically once the
 scorer is up.
 
