@@ -2,13 +2,13 @@
 #
 # Defaults match the RANKER.md / litsearch reranking experiment:
 #   - retriever: Qwen3-Embedding-0.6B FAISS over the per_venue 80K subset
-#   - reranker:  PaperLens-V-3B served by `paperlens serve` (separate HTTP service)
+#   - reranker:  a PaperScorer vision model served by paperlens-serve (separate HTTP service)
 #   - score:     softmax([logp_accept, logp_reject]) -> p_accept in [0,1]
 #   - ranking:   0.3 * z(retriever_score) + 0.7 * p_accept (per-query z-norm)
 #   - retrieve:  fixed 200 candidates per query (k <= 200 trimmed at the end)
 #
 # This server is *orchestration only* -- no GPU, no model weights. The
-# upstream `paperlens serve` does all model work (tokenization parity
+# upstream paperlens-serve does all model work (tokenization parity
 # with training via llamafactory.data.get_dataset).
 
 server:

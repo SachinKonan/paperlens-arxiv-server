@@ -1,4 +1,4 @@
-# Agent / LLM Guide — paperlens-arxiv-server
+# Agent / LLM Guide: paperscorer-arxiv-server
 
 Entry point for any agent (Claude Code, Codex, Cursor, etc.) landing in
 the repo. `README.md` is for humans installing + running the service;
@@ -10,16 +10,16 @@ this file — both CLIs pick up the same content from the cwd.
 ## What this repo is
 
 A **search/rerank orchestration service**: a retriever (FAISS or BM25)
-finds candidates from the ~80K per_venue arXiv subset, then PaperLens-V
-reranks them by predicted-acceptance probability. Exposes a search UI
+finds candidates from the ~80K per_venue arXiv subset, then a PaperScorer
+vision model reranks them by predicted-acceptance probability. Exposes a search UI
 (`GET /`) and JSON endpoints (`/search`, `/search_compare`, `/health`).
 
 This server is **orchestration only** — no GPU, no model weights. Two
 upstreams do the work:
 
-- `external/arxiv_retriever` (git submodule, conda env `retriever`) —
+- `external/arxiv_retriever` (conda env `retriever`) —
   FAISS / BM25 server, port 8001.
-- `paperlens-serve` (in `../paperlens-training-and-inference`) — vLLM
+- `paperlens-serve` (in `../../paperscorer-training-and-inference`) — vLLM
   scorer; we POST sharegpt rows to its `/score` endpoint.
 
 Single human doc: [`README.md`](README.md) — quickstart, endpoints, UI,
@@ -32,13 +32,13 @@ config, drift note.
 | Task | Start here |
 |---|---|
 | Local dev launch | [`README.md`](README.md) → Quickstart. `bash scripts/launch_local.sh`. |
-| Provision through the orchestrator | `paperlens setup --with-retrieval` then `paperlens serve --with-retrieval` (parent repo `../`). Code lives in `../src/paperlens_orchestrator/retrieval.py` + `workflow.serve_retrieval`. |
+| Provision through the orchestrator | `paperscorer setup --with-retrieval` then `paperscorer serve --with-retrieval` (repo root `../..`). Code lives in `../../src/paperscorer_orchestrator/retrieval.py` + `workflow.serve_retrieval`. |
 | Change rerank pool size / blend weights | `configs/server.yaml` — `search.rerank_pool`, `search.compare_top`, `search.blend_weight_*`. |
 | Add a new endpoint | `src/paperlens_arxiv_server/server.py` — define pydantic models, add a `@app.post(...)` handler. Reuse `_rank_pool` if it needs retrieval + rerank. |
 | Modify the search UI | `src/paperlens_arxiv_server/ui/index.html` — single-file vanilla JS, no build step. Served by `GET /`. |
 | Debug "no cache hits" | `cache.py`. Rows are keyed by `(ckpt_id, arxiv_id)` where `ckpt_id = sha1[:12](scorer's ckpt_path)`. Confirm via `GET /health` `ckpt_id` matches what was bootstrapped. |
-| Seed the cache | `scripts/bootstrap_cache_from_litsearch.py`. Auto-runs from `paperlens serve --with-retrieval` once the scorer reports its ckpt_path. |
-| Upload a new index bundle to HF | `scripts/upload_indexes_to_hf.py`. **Not** included in the PaperLens-pinned commit — lives in this repo's main history but the parent pin points at the commit *before* it. |
+| Seed the cache | `scripts/bootstrap_cache_from_litsearch.py`. Auto-runs from `paperscorer serve --with-retrieval` once the scorer reports its ckpt_path. |
+| Upload a new index bundle to HF | `scripts/upload_indexes_to_hf.py`. |
 | Change retriever (qwen ↔ bm25) | `cfg.retrieval.retriever` in the orchestrator. The orchestrator's `render_retriever_config` emits the matching yaml (`name: qwen3` / `name: bm25`). |
 | Investigate a wrong arxiv_id in results | `external/arxiv_retriever` `retrieval_server.py` resolves faiss-pos → arxiv_id via `corpus[idx]['id']` then `arxiv_id_to_pos`. Subset-index bug: see `eca2e65` in arxiv_retriever. |
 
@@ -54,7 +54,7 @@ config, drift note.
    `paperlens-serve /health`, hash the reported `ckpt_path`, and use
    that as `ckpt_id`. The bootstrap step must use the **same** ckpt_path
    or its rows are invisible to the running server.
-3. **Path layout must match `paperlens_orchestrator.retrieval.BUNDLE`.**
+3. **Path layout must match `paperscorer_orchestrator.retrieval.BUNDLE`.**
    `scripts/upload_indexes_to_hf.py::DEST` and the orchestrator's
    `BUNDLE` dict are two halves of the same contract — change either,
    change both.
@@ -63,7 +63,7 @@ config, drift note.
 5. **No hardcoded `/scratch/...` paths.** All defaults read from
    `configs/server.yaml` or env (`PAPERLENS_DATA_ROOT`,
    `PAPERLENS_IMAGES_ROOT`, `HF_HOME`). The upload script's
-   `--bm25 / --faiss / --corpus` are REQUIRED args (no della defaults).
+   `--bm25 / --faiss / --corpus` are REQUIRED args (no cluster-specific defaults).
 6. **`compute_arch` is auditable.** Every cache row is tagged with the
    GPU class that produced it. Mixed-arch caches are operationally fine
    but accountable — `SELECT compute_arch, COUNT(*) FROM p_accept GROUP BY 1`.
@@ -92,19 +92,19 @@ config, drift note.
 
 ---
 
-## Sibling repos
+## Sibling directories
 
-- [`external/arxiv_retriever`](external/arxiv_retriever) — nested git
-  submodule, separate **conda** env (faiss-gpu). The actual FAISS / BM25
+- [`external/arxiv_retriever`](external/arxiv_retriever) — separate
+  **conda** env (faiss-gpu). The actual FAISS / BM25
   server lives there. We POST `/retrieve`. Per-venue subset-index fix
   (`arxiv_id_to_pos`) landed at commit `eca2e65`; older pins return
   wrong arxiv_ids on subset indexes (0% recall).
-- [`../paperlens-training-and-inference`](../paperlens-training-and-inference)
+- [`../../paperscorer-training-and-inference`](../../paperscorer-training-and-inference)
   — provides `paperlens-serve` (vLLM, the reranker checkpoint). Its
   `/health` reports `ckpt_path` which we hash for the cache key.
-- [`..`](..) — the PaperLens orchestrator parent. `paperlens setup
-  --with-retrieval` and `paperlens serve --with-retrieval` drive the
-  whole stack; the relevant code is `src/paperlens_orchestrator/retrieval.py`
+- [`../..`](../..) — the PaperScorer repo root (orchestrator). `paperscorer setup
+  --with-retrieval` and `paperscorer serve --with-retrieval` drive the
+  whole stack; the relevant code is `src/paperscorer_orchestrator/retrieval.py`
   and `workflow.serve_retrieval`.
 
 If you change the bundle layout, the SQLite cache schema, or the

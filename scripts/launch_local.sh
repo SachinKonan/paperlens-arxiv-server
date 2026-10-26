@@ -17,8 +17,9 @@ mkdir -p logs
 # --- 1) arxiv_retriever (conda env "retriever") ---
 RETRIEVER_PORT="${RETRIEVER_PORT:-8001}"
 # Config resolution (absolute paths, so retrieval_launch.sh uses them verbatim):
-#   explicit RETRIEVER_CFG > the per_venue config `paperlens setup --with-retrieval`
-#   generates > the committed per_venue config. (NOT the full-corpus qwen3_06b.yaml.)
+#   explicit RETRIEVER_CFG > the per_venue config `paperscorer setup --with-retrieval`
+#   generates > the committed per_venue config (paths relative to
+#   external/arxiv_retriever/). (NOT the full-corpus qwen3_06b.yaml.)
 ARXIV_SERVER_ROOT="$(pwd)"
 if [ -z "${RETRIEVER_CFG:-}" ]; then
     if [ -f "${ARXIV_SERVER_ROOT}/configs/retriever.generated.yaml" ]; then

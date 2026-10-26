@@ -1,12 +1,12 @@
-# paperlens-arxiv-server
+# paperscorer-arxiv-server
 
 A search/rerank service for arXiv papers. A retriever (FAISS or BM25) finds
-candidates from the ~80K **per_venue** subset; **PaperLens-V** then reranks
+candidates from the ~80K **per_venue** subset; a **PaperScorer** vision model then reranks
 them by predicted-acceptance probability. Exposes a query UI and a JSON API.
 
 ```
 user → POST /search_compare {query}
-  paperlens-arxiv-server  (this repo, port 8000)
+  paperscorer-arxiv-server  (this service, port 8000)
     1. retriever.retrieve(query, topk=pool)        → candidates by retriever rank
     2. cache.get(ckpt_id, arxiv_ids)               → partition into hits / misses
     3. reranker.score(misses)                      → POST /score to paperlens-serve (vLLM)
@@ -20,16 +20,16 @@ Two upstream services do the heavy lifting:
 
 - **arxiv_retriever** (`external/arxiv_retriever`, conda env `retriever`) — serves the
   FAISS / BM25 index over the per_venue corpus.
-- **paperlens-serve** (from `paperlens-training-and-inference`) — vLLM-hosts the
-  reranker checkpoint (`PaperLens-V-3B` by default) and exposes `/score`.
+- **paperlens-serve** (from `paperscorer-training-and-inference`) — vLLM-hosts the
+  reranker checkpoint (a PaperScorer vision model, e.g. `skonan/paperscorer-3b-vision-arxiv`) and exposes `/score`.
 
 This server is **orchestration only** — no GPU, no model weights. The
 recommended way to provision and launch the whole stack is via the
-top-level `paperlens` CLI:
+top-level `paperscorer` CLI:
 
 ```bash
-paperlens setup --with-retrieval     # provision data + indexes + conda env + config
-paperlens serve --with-retrieval     # launch scorer + retriever + UI; opens the search UI
+paperscorer setup --with-retrieval   # provision data + indexes + conda env + config
+paperscorer serve --with-retrieval   # launch scorer + retriever + UI; opens the search UI
 ```
 
 This README documents the standalone setup (without the orchestrator) and the
@@ -44,10 +44,9 @@ HTTP API.
 The retriever is **conda** (faiss-gpu is conda-only); this server is **uv/pip**.
 
 ```bash
-# Run from the paperlens-arxiv-server directory: it's already present
-# inside the PaperLens release (`cd PaperLens/tools/paperlens-arxiv-server`),
-# or clone the standalone repo with `--recurse-submodules` to pick up
-# external/arxiv_retriever.
+# Run from this directory of the PaperScorer repo
+# (`cd PaperScorer/tools/paperscorer-arxiv-server`); external/arxiv_retriever
+# is already included there.
 
 # arxiv_retriever conda env (one-off; needs faiss-gpu + pyserini + Java 21)
 conda env create -f external/arxiv_retriever/conda-env.yml
@@ -60,7 +59,7 @@ uv sync                              # creates .venv, installs the package + dep
 
 ### 2. Indexes + p_accept cache seed (from Hugging Face)
 
-`paperlens setup --with-retrieval` clones what it needs from the
+`paperscorer setup --with-retrieval` clones what it needs from the
 [`skonan/PaperScorer-arXiv-embeddings`](https://huggingface.co/datasets/skonan/PaperScorer-arXiv-embeddings)
 dataset into your HF cache:
 
@@ -88,7 +87,7 @@ bash scripts/launch_local.sh         # starts arxiv_retriever (:8001) + this ser
 
 `launch_local.sh` reads `RETRIEVER_CFG` (default: the per_venue qwen3 config; the
 orchestrator writes a fully-resolved `configs/retriever.generated.yaml` when you
-run `paperlens setup --with-retrieval`).
+run `paperscorer setup --with-retrieval`).
 
 Open the search UI at `http://<host>:8000/`.
 
@@ -101,7 +100,7 @@ Open the search UI at `http://<host>:8000/`.
 A minimal page: query box → two columns of results.
 
 - **Base** — top 20 in retriever order.
-- **Reranked** — top 20 after the PaperLens blend.
+- **Reranked** — top 20 after the PaperScorer blend.
 
 Each result shows `p_accept`, retriever score, and **movement** between the two
 orderings (▲N up / ▼N down from the corresponding rank in the other column),
